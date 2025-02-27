@@ -15,7 +15,7 @@ label_encoder = checkpoint['label_encoder']
 
 # Initialize the model (Ensure the architecture matches your saved model)
 model = HybridModel(
-    input_size=30,  # Adjust based on the number of features
+    input_size=30,  
     lstm_hidden=64,  
     lstm_layers=2,  
     transformer_heads=4,  

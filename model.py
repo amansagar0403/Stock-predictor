@@ -179,7 +179,7 @@ class PositionalEncoding(nn.Module):
         self.register_buffer('pe', pe)  # Register buffer directly
 
     def forward(self, x):
-        return x + self.pe[:, :x.size(1), :].to(x.device)  # Add positional encoding
+        return x + self.pe[:, :x.size(1), :].to(x.device) 
 
 class TransformerModel(nn.Module):
     def __init__(self, input_size, num_heads, num_layers, output_size):
@@ -206,7 +206,6 @@ class TransformerModel(nn.Module):
         return self.fc(x[:, -1, :])
 
     
-# Define the GNN Model
 
 def tune_hyperparameters():
     def objective(lr, hidden_size, dropout, batch_size, transformer_layers, xgb_learning_rate, xgb_max_depth):
@@ -243,8 +242,8 @@ def tune_hyperparameters():
     'dropout': (0.1, 0.5),
     'batch_size': (32, 128),
     'transformer_layers': (1, 4),
-    'xgb_learning_rate': (0.001, 0.1),  # NEW: Optimize XGBoost learning rate
-    'xgb_max_depth': (3, 10)  # NEW: Optimize XGBoost tree depth
+    'xgb_learning_rate': (0.001, 0.1),  
+    'xgb_max_depth': (3, 10)  
 }
 
 
@@ -425,21 +424,21 @@ def load_and_preprocess_data(file_path, chunk_size=100000):
 
         dataset = pd.concat(dataset_chunks, ignore_index=True)
 
-        # Create and apply LabelEncoder for stock tickers
+        # 
         label_encoder = LabelEncoder()
         dataset['Ticker'] = label_encoder.fit_transform(dataset['Ticker'])
 
-        # Add new features to `feature_columns`
+        #
         feature_columns = ['Close', 'RSI', 'MACD', 'BB_Upper', 'BB_Lower',
                            'Volume_SMA', 'SMA_20', 'SMA_50', 'Volatility',
-                           'Daily_Return', 'Sentiment', 'Trend',  # Existing features
-                           'GDP_Growth', 'Inflation_Rate', 'Interest_Rate']  # New features
+                           'Daily_Return', 'Sentiment', 'Trend', 
+                           'GDP_Growth', 'Inflation_Rate', 'Interest_Rate']  
 
         # Scale numerical features
         scaler = MinMaxScaler()
         dataset[feature_columns] = scaler.fit_transform(dataset[feature_columns])
 
-        return dataset, scaler, label_encoder, feature_columns  # ✅ Now returning label_encoder
+        return dataset, scaler, label_encoder, feature_columns  
 
     except Exception as e:
         print(f"Error loading or preprocessing data: {e}")
@@ -647,8 +646,8 @@ if __name__ == "__main__":
     transformer_heads=4,
     transformer_layers=2,
     output_size=1,
-    xgb_learning_rate=best_params['xgb_learning_rate'],  # ✅ Add this
-    xgb_max_depth=int(best_params['xgb_max_depth'])  # ✅ Add this
+    xgb_learning_rate=best_params['xgb_learning_rate'], 
+    xgb_max_depth=int(best_params['xgb_max_depth']) 
 ).to(device)
 
 
