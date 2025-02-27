@@ -7,6 +7,7 @@ import datetime
 import matplotlib.pyplot as plt
 from sklearn.preprocessing import MinMaxScaler
 from model import HybridModel
+import os
 
 # Load the trained model
 checkpoint = torch.load("hybrid_stock_model_complete.pth", map_location=torch.device("cpu"))
@@ -27,11 +28,65 @@ model = HybridModel(
 model.load_state_dict(checkpoint['model_state_dict'])
 model.eval()
 
+def fetch_macro_data(start_date, end_date):
+    """
+    Fetch real macroeconomic indicators from the FRED API.
+    """
+    try:
+        API_KEY = os.getenv("FRED_API_KEY")  # Load API key securely
+        if not API_KEY:
+            raise ValueError("API key not found. Store it in the .env file.")
+
+        indicators = {
+            "GDP_Growth": "A191RL1Q225SBEA",
+            "Inflation_Rate": "CPIAUCSL",
+            "Interest_Rate": "FEDFUNDS"
+        }
+
+        macro_data = pd.DataFrame({'Date': pd.date_range(start=start_date, end=end_date, freq='M')})
+
+        for key, series_id in indicators.items():
+            url = f"https://api.stlouisfed.org/fred/series/observations?series_id={series_id}&api_key={API_KEY}&file_type=json"
+            response = requests.get(url).json()
+            df = pd.DataFrame(response['observations'])
+            df['Date'] = pd.to_datetime(df['date'])
+            df.rename(columns={'value': key}, inplace=True)
+            df[key] = pd.to_numeric(df[key], errors='coerce')
+            macro_data = pd.merge(macro_data, df[['Date', key]], on='Date', how='left')
+
+        macro_data.fillna(method='ffill', inplace=True)
+        return macro_data
+
+    except Exception as e:
+        print(f"Error fetching macro data: {e}")
+        return None
 # Function to fetch real-time stock data
 def get_stock_data(ticker, days=200):
     stock_data = yf.download(ticker, period=f"{days}d", interval="1d")
-    stock_data = stock_data[['Close']]
-    stock_data.rename(columns={'Close': 'Original_Close'}, inplace=True)
+    
+    if stock_data.empty:
+        print(f"Error: No stock data found for {ticker}")
+        return None
+    
+    # Preserve original close price
+    stock_data['Original_Close'] = stock_data['Close']
+
+    # Select required features
+    stock_data = stock_data[['Close', 'RSI', 'MACD', 'BB_Upper', 'BB_Lower', 
+                             'Volume_SMA', 'SMA_20', 'SMA_50', 'Volatility', 
+                             'Daily_Return', 'Sentiment', 'Trend', 'Volume']]
+    
+    # Fetch macroeconomic data
+    macro_data = fetch_macro_data(stock_data.index.min(), stock_data.index.max())
+
+    if macro_data is not None:
+        macro_data["Date"] = macro_data["Date"].dt.to_period("D").astype(str)
+        stock_data.index = stock_data.index.strftime("%Y-%m-%d")
+
+        # Merge macro data
+        stock_data = stock_data.merge(macro_data, on='Date', how='left')
+        stock_data.fillna(method='ffill', inplace=True)
+
     return stock_data
 
 # Function to get real-time USD to INR exchange rate
@@ -52,7 +107,7 @@ def predict_stock_price(ticker):
         return
 
     # Scale data
-    features = scaler.transform(stock_data.values.reshape(-1, 1))
+    features = scaler.transform(stock_data.values)
     stock_tensor = torch.tensor(features, dtype=torch.float32).unsqueeze(0)
 
     # Make prediction

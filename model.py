@@ -429,7 +429,7 @@ def load_and_preprocess_data(file_path, chunk_size=100000):
         dataset['Ticker'] = label_encoder.fit_transform(dataset['Ticker'])
 
         #
-        feature_columns = ['Close', 'RSI', 'MACD', 'BB_Upper', 'BB_Lower',
+        feature_columns = ['Close', 'RSI', 'MACD', 'BB_Upper', 'BB_Lower','Volume',
                            'Volume_SMA', 'SMA_20', 'SMA_50', 'Volatility',
                            'Daily_Return', 'Sentiment', 'Trend', 
                            'GDP_Growth', 'Inflation_Rate', 'Interest_Rate']  
