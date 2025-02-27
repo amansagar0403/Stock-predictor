@@ -54,5 +54,3 @@ python test.py
 - **Market Trend Analysis**: Identifies bullish/bearish trends and suggests optimal trading strategies.
 - **Risk Assessment**: Evaluates stock volatility and market conditions to enhance prediction reliability.
 
-## License
-This project is licensed under the MIT License.
