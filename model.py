@@ -23,7 +23,6 @@ from xgboost import XGBRegressor
 from sklearn.ensemble import RandomForestRegressor
 from bayes_opt import BayesianOptimization
 import torch.nn.functional as F
-from transformers import pipeline
 import psutil
 
 def get_dynamic_batch_size():
@@ -47,7 +46,65 @@ print(f"Using device: {device}")
 load_dotenv()
 sentiment_pipeline = pipeline("sentiment-analysis", model="distilbert/distilbert-base-uncased-finetuned-sst-2-english", device=-1)  # Use CPU
 
-# Reinforcement Learning (Deep Q-Lea
+class TradingEnvironment:
+    def __init__(self, data, initial_balance=10000):
+        self.data = data  # Historical stock data
+        self.initial_balance = initial_balance
+        self.reset()
+
+    def reset(self):
+        self.balance = self.initial_balance
+        self.shares = 0
+        self.current_step = 0
+        return self._get_state()
+
+    def _get_state(self):
+        # Get current stock features
+        current_data = self.data.iloc[self.current_step]
+
+        # Construct the state dictionary
+        state = {
+            'Close': current_data['Close'],  # Current closing price
+            'RSI': current_data['RSI'],  # Relative Strength Index
+            'MACD': current_data['MACD'],  # Moving Average Convergence Divergence
+            'SMA_20': current_data['SMA_20'],  # 20-day Simple Moving Average
+            'Volume': current_data['Volume'],  # Trading volume
+            'GDP_Growth': current_data['GDP_Growth'],  # GDP growth rate
+            'Inflation_Rate': current_data['Inflation_Rate'],  # Inflation rate
+            'Interest_Rate': current_data['Interest_Rate'],  # Interest rate
+            'Balance': self.balance,  # Current cash balance
+            'Shares': self.shares,  # Shares held
+            'Portfolio_Value': self.balance + self.shares * current_data['Close']  # Total portfolio value
+        }
+
+        return state
+
+    def step(self, action):
+        current_price = self.data.iloc[self.current_step]['Close']
+    
+    # Ensure we don't exceed dataset bounds
+        if self.current_step >= len(self.data) - 2:
+            done = True
+            return self._get_state(), 0, done  # Return current state with zero reward
+
+        next_price = self.data.iloc[self.current_step + 1]['Close']
+    
+        if action == 1:  # Buy
+            self.shares += self.balance / current_price
+            self.balance = 0
+        elif action == 2:  # Sell
+            self.balance += self.shares * current_price
+            self.shares = 0
+
+        portfolio_value = self.balance + self.shares * next_price
+        reward = portfolio_value - self.initial_balance
+
+        self.current_step += 1
+        done = self.current_step >= len(self.data) - 1
+
+        next_state = self._get_state()
+        return next_state, reward, done
+
 class NoisyLinear(nn.Module):
     def __init__(self, in_features, out_features, std_init=0.4):
         super(NoisyLinear, self).__init__()
@@ -107,9 +164,9 @@ class DQNAgent:
         self.optimizer = optim.Adam(self.model.parameters(), lr=self.learning_rate)
         self.criterion = nn.MSELoss()
         
-        self.temperature = 1.0  # 🔥 Initial high temperature for more exploration
-        self.temperature_decay = 0.99  # 🔽 Reduce temperature over time
-        self.min_temperature = 0.1  # ❄️ Prevent it from becoming too small
+        self.temperature = 1.0  # Initial high temperature for exploration
+        self.temperature_decay = 0.99  # Reduce temperature over time
+        self.min_temperature = 0.1  # Minimum temperature
 
     def _build_noisy_net(self):
         return nn.Sequential(
@@ -125,12 +182,18 @@ class DQNAgent:
 
     def act(self, state):
         with torch.no_grad():
-            q_values = self.model(state)
-            boltzmann_probs = torch.exp(q_values / self.temperature)
-            boltzmann_probs /= boltzmann_probs.sum()
-            action = torch.multinomial(boltzmann_probs, 1).item()
+        # Use the model to predict the next price
+            predicted_price = self.model(state).item()
 
-    # 🔽 Apply temperature decay AFTER action is chosen
+        # Choose action based on predicted price
+            if predicted_price > state['Close']:
+                action = 1  # Buy
+            elif predicted_price < state['Close']:
+                action = 2  # Sell
+            else:
+                action = 0  # Hold
+
+    # Apply temperature decay
         self.temperature = max(self.temperature * self.temperature_decay, self.min_temperature)
 
         return action
@@ -146,7 +209,7 @@ class DQNAgent:
                 with torch.no_grad():
                     target = reward + self.gamma * torch.max(self.target_model(next_state))
             
-            current_q = self.model(state)[action]
+            current_q = self.model(state).gather(1, torch.tensor([[action]], dtype=torch.long))
             
             loss = self.criterion(current_q, target)
             self.optimizer.zero_grad()
@@ -156,8 +219,7 @@ class DQNAgent:
 class LSTMModel(nn.Module):
     def __init__(self, input_size, hidden_size, num_layers, output_size):
         super(LSTMModel, self).__init__()
-        self.lstm = nn.LSTM(input_size, hidden_size, num_layers, 
-                          batch_first=True, dropout=0.3)
+        self.lstm = nn.LSTM(input_size, hidden_size, num_layers, batch_first=True, dropout=0.3)
         self.layer_norm = nn.LayerNorm(hidden_size)
         self.fc = nn.Linear(hidden_size, output_size)
 
@@ -184,23 +246,15 @@ class PositionalEncoding(nn.Module):
 class TransformerModel(nn.Module):
     def __init__(self, input_size, num_heads, num_layers, output_size):
         super(TransformerModel, self).__init__()
-        self.embed_dim = ((input_size + num_heads - 1) // num_heads * num_heads)  # Ensure divisibility
-        
-        # Use a linear projection instead of constant padding
+        self.embed_dim = ((input_size + num_heads - 1) // num_heads * num_heads)
         self.input_projection = nn.Linear(input_size, self.embed_dim)
-
         self.pos_encoder = PositionalEncoding(self.embed_dim)
-
-        encoder_layer = nn.TransformerEncoderLayer(
-            d_model=self.embed_dim, 
-            nhead=num_heads, 
-            batch_first=True
-        )
+        encoder_layer = nn.TransformerEncoderLayer(d_model=self.embed_dim, nhead=num_heads, batch_first=True)
         self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
         self.fc = nn.Linear(self.embed_dim, output_size)
 
     def forward(self, x):
-        x = self.input_projection(x)  # Project input to embed_dim
+        x = self.input_projection(x)
         x = self.pos_encoder(x)
         x = self.transformer(x)
         return self.fc(x[:, -1, :])
@@ -266,49 +320,67 @@ def fetch_historical_sentiment(ticker, date):
 
     return 0  # Default neutral sentiment if everything fails
 
-def scrape_news_sentiment(ticker, date, max_retries=3):
+def get_sentiment(ticker, date, max_retries=3):
     """
-    Fetch sentiment for a specific stock ticker on a given date.
-    Handles single-letter tickers carefully.
+    Fetch sentiment score from stock news using both Yahoo Finance and Google News.
+    If not available, estimate sentiment from stock movement.
     """
-    time.sleep(2)  # Delay between requests
+    time.sleep(2)  # Delay to prevent rate-limiting
     attempt = 0
-    formatted_date = date.strftime('%Y-%m-%d')  # Ensure date format is correct
+    formatted_date = date.strftime('%Y-%m-%d')
 
-    # Handle single-letter stock names separately
-    if len(ticker) == 1:
-        print(f"⚠️ Handling single-letter ticker: {ticker}")
-        search_query = f"{ticker} stock news {formatted_date}"
-    else:
-        search_query = f"{ticker} stock news"
+    sentiment_scores = []
 
+    # **1️⃣ Fetch news sentiment from Yahoo Finance**
+    try:
+        yahoo_url = f"https://finance.yahoo.com/quote/{ticker}/news"
+        headers = {'User-Agent': 'Mozilla/5.0'}
+        response = requests.get(yahoo_url, headers=headers, timeout=20)
+        soup = BeautifulSoup(response.text, 'html.parser')
+        headlines = [item.text for item in soup.find_all('h3')]
+
+        # Filter out irrelevant results
+        filtered_headlines = [h for h in headlines if ticker in h.upper() or "stock" in h.lower()]
+
+        # Run sentiment analysis on headlines
+        sentiment_scores.extend([sentiment_pipeline(headline)[0]['score'] for headline in filtered_headlines])
+
+    except Exception as e:
+        print(f"⚠️ Yahoo Finance sentiment failed for {ticker} on {formatted_date}: {e}")
+
+    # **2️⃣ Fetch news sentiment from Google News**
     while attempt < max_retries:
         try:
-            url = f"https://finance.yahoo.com/quote/{ticker}/news"
-            headers = {'User-Agent': 'Mozilla/5.0'}
-            response = requests.get(url, headers=headers, timeout=20)
+            google_url = f"https://www.google.com/search?q={ticker}+stock+news+{formatted_date}&tbm=nws"
+            response = requests.get(google_url, headers=headers, timeout=20)
             soup = BeautifulSoup(response.text, 'html.parser')
+            google_headlines = [item.text for item in soup.find_all('h3')]
 
-            # Extract headlines
-            headlines = [item.text for item in soup.find_all('h3')]
-
-            # Filter out irrelevant results (for single-letter stocks)
-            filtered_headlines = [h for h in headlines if ticker in h.upper() or "stock" in h.lower()]
-
-            sentiment_scores = [sentiment_pipeline(headline)[0]['score'] for headline in filtered_headlines]
-
-            return np.mean(sentiment_scores) if sentiment_scores else 0  # Return average sentiment
+            sentiment_scores.extend([sentiment_pipeline(headline)[0]['score'] for headline in google_headlines])
+            break  # Stop retrying if successful
 
         except requests.exceptions.Timeout:
             attempt += 1
-            print(f"Timeout for {ticker} on {formatted_date}. Retrying {attempt}/{max_retries}...")
+            print(f"⚠️ Google News timeout for {ticker} on {formatted_date}. Retrying {attempt}/{max_retries}...")
             time.sleep(5)
 
         except Exception as e:
-            print(f"Error fetching sentiment for {ticker} on {formatted_date}: {e}")
-            return 0  # Default to neutral if error
+            print(f"⚠️ Google News sentiment failed for {ticker} on {formatted_date}: {e}")
+            break  # Exit if an unknown error occurs
 
-    return 0  # Default sentiment if all retries fail
+    # **3️⃣ Fallback: Estimate sentiment from stock movement**
+    if not sentiment_scores:
+        try:
+            stock_data = yf.download(ticker, start=date, end=date)
+            if not stock_data.empty:
+                daily_change = (stock_data['Close'][0] - stock_data['Open'][0]) / stock_data['Open'][0]
+                return daily_change  # Use % price change as sentiment proxy
+        except Exception as e:
+            print(f"⚠️ Yahoo Finance stock price fallback failed for {ticker} on {formatted_date}: {e}")
+
+        return 0  # Default neutral sentiment if everything fails
+
+    return np.mean(sentiment_scores)  # Return the average sentiment score
 
 def fetch_search_trends(ticker):
     pytrends = TrendReq(hl='en-US', tz=360)
@@ -322,49 +394,18 @@ class HybridModel(nn.Module):
         super(HybridModel, self).__init__()
         self.lstm = LSTMModel(input_size, lstm_hidden, lstm_layers, output_size)
         self.transformer = TransformerModel(input_size, transformer_heads, transformer_layers, output_size)
-
-        # XGBoost model as an additional predictor
-        self.xgb = XGBRegressor(n_estimators=100,learning_rate=xgb_learning_rate,max_depth=int(xgb_max_depth))  # ✅ Use optimized tree depth
-
-
+        self.xgb = XGBRegressor(n_estimators=100, learning_rate=xgb_learning_rate, max_depth=int(xgb_max_depth))
         self.fc = nn.Linear(output_size * 2 + 3, output_size)  # +3 for GDP, Inflation, Interest Rate
         self.dropout = nn.Dropout(0.3)
 
     def forward(self, x):
         lstm_out = self.lstm(x)
         transformer_out = self.transformer(x)
-
-        # Convert to NumPy for XGBoost (outside PyTorch computation graph)
         x_np = x.cpu().detach().numpy().reshape(x.shape[0], -1)
-        x_np = np.nan_to_num(x_np)  # ✅ Replace NaNs with 0 to prevent crashes
+        x_np = x.cpu().detach().numpy().reshape(x.shape[0], -1)
         xgb_out = torch.tensor(self.xgb.predict(x_np), dtype=torch.float32).unsqueeze(1).to(x.device)
-
         combined = torch.cat([lstm_out, transformer_out, xgb_out, x[:, -1, -3:]], dim=1)  # Last 3 features: GDP, Inflation, Interest Rate
         return self.fc(self.dropout(combined))
-
-def fetch_news_sentiment(date, ticker=None):
-    """
-    Fetch sentiment for a specific date using Google News.
-    """
-    try:
-        formatted_date = date.strftime('%Y-%m-%d')
-        search_query = f"{ticker} stock news {formatted_date}" if ticker else f"stock news {formatted_date}"
-        url = f"https://www.google.com/search?q={search_query}&tbm=nws"
-        headers = {'User-Agent': 'Mozilla/5.0'}
-        response = requests.get(url, headers=headers, timeout=20)
-        soup = BeautifulSoup(response.text, 'html.parser')
-
-        headlines = [item.text for item in soup.find_all('h3')]
-        sentiment_scores = [sentiment_pipeline(headline)[0]['score'] for headline in headlines]
-
-        if len(sentiment_scores) == 0:
-            return 0  # Default neutral sentiment if no news
-
-        return np.mean(sentiment_scores)
-
-    except Exception as e:
-        print(f"Error fetching news sentiment for {date}: {e}")
-        return 0  # Default neutral sentiment if error
 
 import os
 # Load and preprocess multi-stock dataset
@@ -389,6 +430,7 @@ def fetch_macro_data(start_date, end_date):
         for key, series_id in indicators.items():
             url = f"https://api.stlouisfed.org/fred/series/observations?series_id={series_id}&api_key={API_KEY}&file_type=json"
             response = requests.get(url).json()
+            time.sleep(2)
             df = pd.DataFrame(response['observations'])
             df['Date'] = pd.to_datetime(df['date'])
             df.rename(columns={'value': key}, inplace=True)
@@ -522,6 +564,9 @@ def train_hybrid_model(model, train_loader, dqn_agent, epochs=10, device='cpu'):
     optimizer = optim.Adam(model.parameters(), lr=0.001)
     criterion = nn.MSELoss()
 
+    # Initialize trading environment
+    env = TradingEnvironment(train_data)  # Replace `train_data` with your training dataset
+
     model.train()
     dqn_agent.model.train()
 
@@ -532,11 +577,34 @@ def train_hybrid_model(model, train_loader, dqn_agent, epochs=10, device='cpu'):
     optimizer.zero_grad()
 
     for epoch in range(epochs):
+        state = env.reset()  # Reset the environment at the start of each epoch
         total_loss = 0
+        total_reward = 0
+
         for batch_idx, (data, target) in enumerate(train_loader):
             data, target = data.to(device), target.to(device)
 
+            # Get model prediction
             output = model(data)
+            predicted_price = output.item()
+
+            # DQN agent chooses action based on state and prediction
+            action = dqn_agent.act(state)
+
+            # Execute action in the environment
+            next_state, reward, done = env.step(action)
+
+            # Store experience in DQN agent's memory
+            dqn_agent.memory.append((state, action, reward, next_state, done))
+
+            # Train DQN agent
+            dqn_agent.replay(batch_size=32)
+
+            # Update state and total reward
+            state = next_state
+            total_reward += reward
+
+            # Train the hybrid model
             loss = criterion(output, target)
             (loss / accumulation_steps).backward()
 
@@ -551,14 +619,14 @@ def train_hybrid_model(model, train_loader, dqn_agent, epochs=10, device='cpu'):
             xgb_targets.append(target.cpu().numpy())
 
         avg_loss = total_loss / len(train_loader)
-        print(f'Epoch {epoch+1}/{epochs} complete | Avg Loss: {avg_loss:.6f}')
+        print(f'Epoch {epoch+1}/{epochs} complete | Avg Loss: {avg_loss:.6f} | Total Reward: {total_reward:.2f}')
 
         if epoch % 2 == 0:
             dqn_agent.update_target_model()
 
     # Train XGBoost on accumulated features
-    xgb_features = np.nan_to_num(np.vstack(xgb_features))  # ✅ Replace NaNs with 0
-    xgb_targets = np.nan_to_num(np.vstack(xgb_targets).ravel())  # ✅ Replace NaNs with 0
+    xgb_features = np.nan_to_num(np.vstack(xgb_features))  # Replace NaNs with 0
+    xgb_targets = np.nan_to_num(np.vstack(xgb_targets).ravel())  # Replace NaNs with 0
     model.xgb.fit(xgb_features, xgb_targets)
 
     return model, dqn_agent
