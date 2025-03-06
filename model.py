@@ -181,22 +181,27 @@ class DQNAgent:
         self.target_model.load_state_dict(self.model.state_dict())
 
     def act(self, state):
+    # Convert dictionary to a tensor
+        state_tensor = torch.tensor([list(state.values())], dtype=torch.float32).to(next(self.model.parameters()).device)
+
         with torch.no_grad():
-        # Use the model to predict the next price
-            predicted_price = self.model(state).item()
+            output = self.model(state_tensor)  # Model's output (could be single or multiple values)
 
-        # Choose action based on predicted price
-            if predicted_price > state['Close']:
-                action = 1  # Buy
-            elif predicted_price < state['Close']:
-                action = 2  # Sell
-            else:
-                action = 0  # Hold
+        if output.numel() == 1:  
+            predicted_price = output.item()  # Extract scalar value
+        else:
+            predicted_price = output.squeeze().cpu().numpy()  # Convert tensor to NumPy array
 
-    # Apply temperature decay
+        if predicted_price > state['Close']:
+            action = 1  # Buy
+        elif predicted_price < state['Close']:
+            action = 2  # Sell
+        else:
+            action = 0  # Hold
+
         self.temperature = max(self.temperature * self.temperature_decay, self.min_temperature)
-
         return action
+
         
     def replay(self, batch_size):
         if len(self.memory) < batch_size:
@@ -259,24 +264,22 @@ class TransformerModel(nn.Module):
         x = self.transformer(x)
         return self.fc(x[:, -1, :])
 
-    
-
 def tune_hyperparameters():
     def objective(lr, hidden_size, dropout, batch_size, transformer_layers, xgb_learning_rate, xgb_max_depth):
         model = HybridModel(
-    input_size=len(feature_columns),
-    lstm_hidden=int(hidden_size),
-    lstm_layers=2,
-    transformer_heads=4,
-    transformer_layers=int(transformer_layers),
-    output_size=1,
-    xgb_learning_rate=xgb_learning_rate,  # ✅ Pass optimized XGBoost learning rate
-    xgb_max_depth=int(xgb_max_depth)  # ✅ Pass optimized XGBoost max depth
-)
+            input_size=len(feature_columns),
+            lstm_hidden=int(hidden_size),
+            lstm_layers=2,
+            transformer_heads=4,
+            transformer_layers=int(transformer_layers),
+            output_size=1,
+            xgb_learning_rate=xgb_learning_rate,
+            xgb_max_depth=int(xgb_max_depth)
+        )
 
         optimizer = optim.Adam(model.parameters(), lr=lr)
         criterion = nn.MSELoss()
-        
+
         # Train the model (simplified for demonstration)
         for epoch in range(5):
             for data, target in train_loader:
@@ -285,26 +288,30 @@ def tune_hyperparameters():
                 loss = criterion(output, target)
                 loss.backward()
                 optimizer.step()
-        
+
         # Evaluate on validation set
         val_loss = evaluate_model(model, test_loader, criterion)
+
+        # ✅ Delete model and clear cache to prevent memory leaks
+        del model
+        torch.cuda.empty_cache()  # ✅ Frees GPU memory
         return -val_loss  # Maximize negative validation loss
 
     pbounds = {
-    'lr': (0.0001, 0.01),
-    'hidden_size': (32, 128),
-    'dropout': (0.1, 0.5),
-    'batch_size': (32, 128),
-    'transformer_layers': (1, 4),
-    'xgb_learning_rate': (0.001, 0.1),  
-    'xgb_max_depth': (3, 10)  
-}
-
+        'lr': (0.0001, 0.01),
+        'hidden_size': (32, 128),
+        'dropout': (0.1, 0.5),
+        'batch_size': (32, 128),
+        'transformer_layers': (1, 4),
+        'xgb_learning_rate': (0.001, 0.1),
+        'xgb_max_depth': (3, 10)
+    }
 
     optimizer = BayesianOptimization(f=objective, pbounds=pbounds)
     optimizer.maximize(init_points=5, n_iter=10)
-    
+
     return optimizer.max
+
 
 def fetch_historical_sentiment(ticker, date):
     """
@@ -356,8 +363,11 @@ def get_sentiment(ticker, date, max_retries=3):
             soup = BeautifulSoup(response.text, 'html.parser')
             google_headlines = [item.text for item in soup.find_all('h3')]
 
-            sentiment_scores.extend([sentiment_pipeline(headline)[0]['score'] for headline in google_headlines])
-            break  # Stop retrying if successful
+            if google_headlines: 
+                sentiment_scores.extend([sentiment_pipeline(headline)[0]['score'] for headline in google_headlines])
+            else:
+                print(f"⚠️ No news found for {ticker} on {formatted_date}. Using fallback sentiment.")
+            break  
 
         except requests.exceptions.Timeout:
             attempt += 1
@@ -401,7 +411,6 @@ class HybridModel(nn.Module):
     def forward(self, x):
         lstm_out = self.lstm(x)
         transformer_out = self.transformer(x)
-        x_np = x.cpu().detach().numpy().reshape(x.shape[0], -1)
         x_np = x.cpu().detach().numpy().reshape(x.shape[0], -1)
         xgb_out = torch.tensor(self.xgb.predict(x_np), dtype=torch.float32).unsqueeze(1).to(x.device)
         combined = torch.cat([lstm_out, transformer_out, xgb_out, x[:, -1, -3:]], dim=1)  # Last 3 features: GDP, Inflation, Interest Rate
@@ -449,34 +458,32 @@ def load_and_preprocess_data(file_path, chunk_size=100000):
     try:
         dataset_chunks = []
         
-        # Load stock data
         for chunk in pd.read_csv(file_path, parse_dates=['Date'], chunksize=chunk_size):
             chunk = chunk.sort_values(['Ticker', 'Date'])
 
-            # Fetch macroeconomic data for the stock date range
+            # Fetch macroeconomic data
             macro_data = fetch_macro_data(chunk['Date'].min(), chunk['Date'].max())
-
-            # Merge stock data with macroeconomic indicators on Date
             chunk = pd.merge(chunk, macro_data, on='Date', how='left')
-
-            # Fill missing macro values with previous month's data
             chunk.fillna(method='ffill', inplace=True)
+
+            # ✅ Fetch sentiment for each stock on its respective date
+            chunk['Sentiment'] = chunk.apply(lambda row: get_sentiment(row['Ticker'], row['Date']), axis=1)
 
             dataset_chunks.append(chunk)
 
         dataset = pd.concat(dataset_chunks, ignore_index=True)
 
-        # 
+        # Encode ticker names
         label_encoder = LabelEncoder()
         dataset['Ticker'] = label_encoder.fit_transform(dataset['Ticker'])
 
-        #
-        feature_columns = ['Close', 'RSI', 'MACD', 'BB_Upper', 'BB_Lower','Volume',
+        # ✅ Make sure Sentiment is part of feature columns
+        feature_columns = ['Close', 'RSI', 'MACD', 'BB_Upper', 'BB_Lower', 'Volume',
                            'Volume_SMA', 'SMA_20', 'SMA_50', 'Volatility',
                            'Daily_Return', 'Sentiment', 'Trend', 
                            'GDP_Growth', 'Inflation_Rate', 'Interest_Rate']  
 
-        # Scale numerical features
+        # Scale features
         scaler = MinMaxScaler()
         dataset[feature_columns] = scaler.fit_transform(dataset[feature_columns])
 
@@ -485,6 +492,7 @@ def load_and_preprocess_data(file_path, chunk_size=100000):
     except Exception as e:
         print(f"Error loading or preprocessing data: {e}")
         return None, None, None, None
+
 
 
 def create_data_loaders(X, y, batch_size=64):
@@ -560,24 +568,21 @@ def predict_real_time(model, stock_data, scaler, stock_features, device='cpu'):
     
     return inverse_prediction[0, 0]
 
-def train_hybrid_model(model, train_loader, dqn_agent, epochs=10, device='cpu'):
+def train_hybrid_model(model, train_loader, dqn_agent,train_data, epochs=10, device='cpu'):
     optimizer = optim.Adam(model.parameters(), lr=0.001)
     criterion = nn.MSELoss()
 
     # Initialize trading environment
-    env = TradingEnvironment(train_data)  # Replace `train_data` with your training dataset
+    env = TradingEnvironment(train_data)  # Replace `train_data` with your dataset
 
     model.train()
     dqn_agent.model.train()
-
-    # Prepare XGBoost training data
-    xgb_features, xgb_targets = [], []
 
     accumulation_steps = 4  
     optimizer.zero_grad()
 
     for epoch in range(epochs):
-        state = env.reset()  # Reset the environment at the start of each epoch
+        state = env.reset()  # Reset environment at start of each epoch
         total_loss = 0
         total_reward = 0
 
@@ -586,48 +591,35 @@ def train_hybrid_model(model, train_loader, dqn_agent, epochs=10, device='cpu'):
 
             # Get model prediction
             output = model(data)
-            predicted_price = output.item()
-
-            # DQN agent chooses action based on state and prediction
-            action = dqn_agent.act(state)
-
-            # Execute action in the environment
-            next_state, reward, done = env.step(action)
-
-            # Store experience in DQN agent's memory
-            dqn_agent.memory.append((state, action, reward, next_state, done))
-
-            # Train DQN agent
-            dqn_agent.replay(batch_size=32)
-
-            # Update state and total reward
-            state = next_state
-            total_reward += reward
-
-            # Train the hybrid model
             loss = criterion(output, target)
             (loss / accumulation_steps).backward()
 
             if (batch_idx + 1) % accumulation_steps == 0 or (batch_idx + 1 == len(train_loader)):
                 optimizer.step()
                 optimizer.zero_grad()
+
+            # Convert batch to NumPy for XGBoost training
+            data_np = data.cpu().numpy().reshape(data.shape[0], -1)
+            target_np = target.cpu().numpy().ravel()  # Ensure 1D target
+
+            # Train XGBoost incrementally
+            model.xgb.fit(data_np, target_np, xgb_model=model.xgb if batch_idx > 0 else None)
+
+            # Update state for RL Agent
+            action = dqn_agent.act(state)
+            next_state, reward, done = env.step(action)
+            dqn_agent.memory.append((state, action, reward, next_state, done))
+            dqn_agent.replay(batch_size=32)
             
+            state = next_state
+            total_reward += reward
             total_loss += loss.item()
 
-            # Store data for XGBoost
-            xgb_features.append(data.cpu().numpy().reshape(data.shape[0], -1))
-            xgb_targets.append(target.cpu().numpy())
-
         avg_loss = total_loss / len(train_loader)
-        print(f'Epoch {epoch+1}/{epochs} complete | Avg Loss: {avg_loss:.6f} | Total Reward: {total_reward:.2f}')
+        print(f'Epoch {epoch+1}/{epochs} | Loss: {avg_loss:.6f} | Total Reward: {total_reward:.2f}')
 
         if epoch % 2 == 0:
             dqn_agent.update_target_model()
-
-    # Train XGBoost on accumulated features
-    xgb_features = np.nan_to_num(np.vstack(xgb_features))  # Replace NaNs with 0
-    xgb_targets = np.nan_to_num(np.vstack(xgb_targets).ravel())  # Replace NaNs with 0
-    model.xgb.fit(xgb_features, xgb_targets)
 
     return model, dqn_agent
 
@@ -731,6 +723,7 @@ if __name__ == "__main__":
                 model=model, 
                 train_loader=train_loader, 
                 dqn_agent=dqn_agent, 
+                train_data = dataset,
                 epochs=10, 
                 device=device
             )
